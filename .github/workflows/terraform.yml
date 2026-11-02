@@ -1,0 +1,202 @@
+name: terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  WORKDIR: infra/envs/dev
+  # azurerm provider and backend authenticate with the GitHub OIDC token.
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  validate:
+    name: fmt, validate, checkov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff infra
+
+      - name: terraform validate
+        run: |
+          for dir in infra/bootstrap infra/envs/dev; do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: checkov
+        # bootstrap is applied by hand once and holds the state account that
+        # CI must reach over the public endpoint; see docs/DECISIONS.md.
+        run: |
+          pip install --quiet checkov
+          checkov --directory infra --skip-path infra/bootstrap \
+            --framework terraform --compact --quiet
+
+  plan:
+    name: plan
+    # Skipped until bootstrap has run and the repository variables exist.
+    if: github.event_name == 'pull_request' && vars.AZURE_CLIENT_ID_PLAN != ''
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID_PLAN }}
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init -backend-config=backend.hcl
+
+      - name: terraform plan
+        id: plan
+        continue-on-error: true
+        # The plan identity has read-only access to state, so it cannot take
+        # a lease. Applies are serialized by the concurrency group below.
+        run: |
+          set -o pipefail
+          terraform plan -lock=false -no-color -var-file=dev.tfvars -out=tfplan 2>&1 | tee plan.log
+          terraform show -no-color tfplan > plan.txt
+
+      - name: comment plan on PR
+        uses: actions/github-script@v7
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const dir = process.env.WORKDIR;
+            const ok = process.env.PLAN_OUTCOME === 'success';
+            const file = ok ? `${dir}/plan.txt` : `${dir}/plan.log`;
+            let body = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : 'No output captured.';
+
+            const max = 60000;
+            if (body.length > max) {
+              body = body.slice(0, max) + '\n\n... truncated, see the workflow log for the full plan.';
+            }
+
+            const marker = '<!-- terraform-plan:dev -->';
+            const summary = (body.match(/Plan: .*|No changes\..*/) || ['See details'])[0];
+            const status = ok ? 'succeeded' : 'failed';
+            const comment = [
+              marker,
+              `### Terraform plan: \`dev\` ${status}`,
+              `**${summary}**`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```hcl',
+              body,
+              '```',
+              '</details>',
+              '',
+              `Commit ${context.sha.substring(0, 7)} · [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: comment,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment,
+              });
+            }
+
+      - name: fail if plan failed
+        if: steps.plan.outcome != 'success'
+        run: exit 1
+
+  apply:
+    name: apply
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      vars.AZURE_CLIENT_ID_APPLY != ''
+    needs: validate
+    runs-on: ubuntu-latest
+    # The apply identity's federated credential trusts only this environment.
+    # Restrict the environment to the main branch in repo settings.
+    environment: dev
+    concurrency:
+      group: terraform-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID_APPLY }}
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init -backend-config=backend.hcl
+
+      - name: terraform plan
+        run: terraform plan -no-color -var-file=dev.tfvars -out=tfplan
+
+      - name: terraform apply
+        run: terraform apply -no-color tfplan
