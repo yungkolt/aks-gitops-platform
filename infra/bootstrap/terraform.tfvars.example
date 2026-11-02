@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+subscription_id       = "00000000-0000-0000-0000-000000000000"
+budget_contact_emails = ["you@example.com"]
+
+# Optional overrides
+# location           = "westus3"
+# github_owner       = "yungkolt"
+# github_repo        = "aks-gitops-platform"
+# budget_amount      = 25
